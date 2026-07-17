@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>micro:bit 自動えさやり機設定ツール (Bluetooth版)</title>
-<script type="text/javascript" src="https://gc.kis.v2.scr.kaspersky-labs.com/FD126C42-EBFA-4E12-B309-BB3FDD723AC1/main.js?attr=UrDmWrLPZDg8Vc6ZScMW0RP9eLWrH-MDdLPOySSyQyjgOWmCMLI5vtfVNCtbpD-qjt0vuC8tk4gfyGrzxTSamw" charset="UTF-8"></script><style>
+<style>
 body {
 font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
 background-color: #f5f7fa;
@@ -70,6 +70,11 @@ background-color: #e2e8f0;
 color: #a0aec0;
 cursor: not-allowed;
 }
+input[type="time"]:disabled {
+background-color: #edf2f7;
+color: #718096;
+cursor: not-allowed;
+}
 .button-group {
 display: flex;
 gap: 10px;
@@ -109,7 +114,7 @@ font-size: 1.1em;
 <hr style="border: 0; border-top: 1px solid #e2e8f0; margin: 20px 0;">
 
 <label for="timeInput2" style="display:block; text-align:left; font-size:0.9em; color:#718096;">送信する時刻を選択:</label>
-<input type="time" id="timeInput2" value="12:00">
+<input type="time" id="timeInput2" value="12:00" disabled>
 
 <button id="sendBtn" class="btn-send" disabled>えさやり時刻を送信</button>
 
@@ -160,11 +165,22 @@ const server = await bluetoothDevice.gatt.connect();
 const service = await server.getPrimaryService(UART_SERVICE_UUID);
 
 // キャラクタリスティクの取得
+try {
 rxCharacteristic = await service.getCharacteristic(RX_CHARACTERISTIC_UUID);
 txCharacteristic = await service.getCharacteristic(TX_CHARACTERISTIC_UUID);
+} catch (error) {
+console.error("キャラクタリスティク取得エラー:", error);
+throw new Error("必要なBluetoothキャラクタリスティクが見つかりません");
+}
 
 // データ受信のデータ通知（Notification）を開始
+try {
 await rxCharacteristic.startNotifications();
+} catch (error) {
+console.error("Notification開始エラー:", error);
+throw new Error("通知機能の開始に失敗しました");
+}
+
 rxCharacteristic.addEventListener('characteristicvaluechanged', handleDataReceived);
 
 // 切断イベントの監視
@@ -177,26 +193,33 @@ connectBtn.textContent = "接続解除";
 sendBtn.disabled = false;
 esayari.disabled = false;
 teishi.disabled = false;
+timeInput2.disabled = false;
+
+// 接続直後に初期データを要求
+statusDiv.textContent = "状態: 初期データを取得中...";
+await sendData('SYNC\n');
 
 } catch (error) {
 console.error("Bluetooth接続エラー:", error);
-alert("接続に失敗したか、キャンセルされました。");
+alert("接続に失敗しました: " + error.message);
 resetUI();
 }
 });
 
 // データの送信関数
 async function sendData(stringData) {
-if (!txCharacteristic) return;
+if (!txCharacteristic) {
+console.error("txCharacteristicが初期化されていません");
+return;
+}
 try {
 const encoder = new TextEncoder();
 const data = encoder.encode(stringData);
-// 正しく txCharacteristic（PCからの送信）に書き込みを行う
 await txCharacteristic.writeValue(data);
 console.log(`送信成功: ${stringData.trim()}`);
 } catch (error) {
 console.error("送信エラー:", error);
-alert("データの送信に失敗しました。");
+alert("データの送信に失敗しました: " + error.message);
 }
 }
 
@@ -255,6 +278,7 @@ if (num >= 10000) {
 // 10000以上の場合はmicro:bitの「現在時刻」（例: 11130 -> 11:30）
 const timeNum = num - 10000;
 currentTimeDisp.textContent = formatToTimeString(timeNum);
+statusDiv.textContent = "状態: Bluetooth接続済み";
 } else {
 // 10000未満の場合はmicro:bitに保存されている「タイマー設定時間」
 timeInput1.value = formatToTimeString(num);
@@ -304,6 +328,7 @@ connectBtn.textContent = "micro:bit とBluetooth接続";
 sendBtn.disabled = true;
 esayari.disabled = true;
 teishi.disabled = true;
+timeInput2.disabled = true;
 }
 </script>
 </body>
