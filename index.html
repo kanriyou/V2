@@ -173,13 +173,14 @@ font-size: 1.1em;
 <script>
 // micro:bit BLE UART サービスのUUID群
 const UART_SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
-const TX_CHARACTERISTIC_UUID = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // micro:bit受信 (PC送信)
-const RX_CHARACTERISTIC_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // micro:bit送信 (PC受信)
+const TX_CHARACTERISTIC_UUID = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // アプリが受信（micro:bit送信）
+const RX_CHARACTERISTIC_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // アプリが送信（micro:bit受信）
 
 // バッファサイズ制限とタイムアウト
 const MAX_BUFFER_SIZE = 1024;
 const SYNC_TIMEOUT = 5000; // 5秒
 const MAX_LOG_ENTRIES = 20;
+const CHARACTERISTIC_RETRY_DELAY = 500; // キャラクタリスティック取得のリトライ遅延
 
 let bluetoothDevice = null;
 let txCharacteristic = null;
@@ -249,6 +250,22 @@ if (!navigator.bluetooth) {
   connectBtn.disabled = true;
 }
 
+// キャラクタリスティック取得のリトライ関数
+async function getCharacteristicWithRetry(service, characteristicUUID, maxRetries = 3) {
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await service.getCharacteristic(characteristicUUID);
+    } catch (error) {
+      if (i < maxRetries - 1) {
+        addLog(`キャラクタリスティック取得リトライ (${i + 1}/${maxRetries - 1})`, 'warning');
+        await new Promise(resolve => setTimeout(resolve, CHARACTERISTIC_RETRY_DELAY));
+      } else {
+        throw error;
+      }
+    }
+  }
+}
+
 // 接続・切断の切り替え
 connectBtn.addEventListener('click', async () => {
   if (!navigator.bluetooth) return; // 保険
@@ -270,20 +287,25 @@ connectBtn.addEventListener('click', async () => {
       });
       addLog(`デバイス見つかりました: ${bluetoothDevice.name}`, 'success');
     } catch (firstErr) {
-      // ユーザーキャンセルならそのまま投げて上位でキャッチ
-      if (firstErr.name === 'NotFoundError' || firstErr.name === 'DOMException') {
+      // ユーザーキャンセル、デバイスが見つからない、その他のエラーを判定
+      if (firstErr.name === 'NotFoundError') {
         addLog("フィルタ検索でデバイスが見つかりません", 'warning');
-        // フィルタで見つからなかった/拒否された場合、全デバイスから選ぶフォールバックを提案
+        // フィルタで見つからなかった場合、全デバイスから選ぶフォールバックを提案
         const tryAll = confirm('指定のデバイス名が見つかりませんでした。全てのデバイスから選択しますか？(micro:bit を選択してください)');
         if (!tryAll) {
           addLog("ユーザーがキャンセルしました", 'info');
-          throw firstErr;
+          updateStatus("キャンセルしました", 'neutral');
+          return;
         }
         bluetoothDevice = await navigator.bluetooth.requestDevice({
           acceptAllDevices: true,
           optionalServices: [UART_SERVICE_UUID]
         });
         addLog(`デバイス見つかりました: ${bluetoothDevice.name}`, 'success');
+      } else if (firstErr.name === 'SecurityError') {
+        addLog("セキュリティエラー: ユーザーが接続を拒否しました", 'warning');
+        updateStatus("キャンセルしました", 'neutral');
+        return;
       } else {
         throw firstErr;
       }
@@ -292,13 +314,25 @@ connectBtn.addEventListener('click', async () => {
     updateStatus("接続中...", 'neutral');
     addLog("GATT接続開始", 'info');
     const server = await bluetoothDevice.gatt.connect();
-    const service = await server.getPrimaryService(UART_SERVICE_UUID);
-    addLog("UARTサービス取得成功", 'success');
-
-    // キャラクタリスティクの取得
+    addLog("GATT接続成功", 'success');
+    
+    // 短い遅延を追加してサービス検索を安定させる
+    await new Promise(resolve => setTimeout(resolve, 300));
+    
+    let service;
     try {
-      rxCharacteristic = await service.getCharacteristic(RX_CHARACTERISTIC_UUID);
-      txCharacteristic = await service.getCharacteristic(TX_CHARACTERISTIC_UUID);
+      service = await server.getPrimaryService(UART_SERVICE_UUID);
+      addLog("UARTサービス取得成功", 'success');
+    } catch (error) {
+      console.error("UARTサービス取得エラー:", error);
+      addLog(`UARTサービス取得失敗: ${error.message}`, 'error');
+      throw new Error("UART サービスが見つかりません。micro:bit に正しいプログラムが書き込まれているか確認してください");
+    }
+
+    // キャラクタリスティクの取得（リトライ付き）
+    try {
+      txCharacteristic = await getCharacteristicWithRetry(service, TX_CHARACTERISTIC_UUID);
+      rxCharacteristic = await getCharacteristicWithRetry(service, RX_CHARACTERISTIC_UUID);
       addLog("キャラクタリスティック取得成功", 'success');
     } catch (error) {
       console.error("キャラクタリスティク取得エラー:", error);
@@ -308,8 +342,8 @@ connectBtn.addEventListener('click', async () => {
 
     // データ受信のデータ通知（Notification）を開始
     try {
-      await rxCharacteristic.startNotifications();
-      rxCharacteristic.addEventListener('characteristicvaluechanged', handleDataReceived);
+      await txCharacteristic.startNotifications();
+      txCharacteristic.addEventListener('characteristicvaluechanged', handleDataReceived);
       addLog("通知機能開始成功", 'success');
     } catch (error) {
       console.error("Notification開始エラー:", error);
@@ -361,8 +395,8 @@ connectBtn.addEventListener('click', async () => {
 
 // データの送信関数
 async function sendData(stringData) {
-  if (!txCharacteristic) {
-    const errMsg = "txCharacteristicが初期化されていません";
+  if (!rxCharacteristic) {
+    const errMsg = "rxCharacteristicが初期化されていません";
     console.error(errMsg);
     addLog(errMsg, 'error');
     throw new Error("Bluetoothが接続されていません");
@@ -370,7 +404,15 @@ async function sendData(stringData) {
   try {
     const encoder = new TextEncoder();
     const data = encoder.encode(stringData);
-    await txCharacteristic.writeValue(data);
+    
+    // writeWithoutResponseを試みてからwriteValueにフォールバック
+    try {
+      await rxCharacteristic.writeValueWithoutResponse(data);
+    } catch (e) {
+      // writeWithoutResponseが利用できない場合はwriteValueを使用
+      await rxCharacteristic.writeValue(data);
+    }
+    
     addLog(`送信成功: ${stringData.trim()}`, 'success');
     console.log(`送信成功: ${stringData.trim()}`);
   } catch (error) {
@@ -545,8 +587,8 @@ function resetUI() {
   } catch (e) { /* ignore */ }
 
   try {
-    if (rxCharacteristic) {
-      rxCharacteristic.removeEventListener('characteristicvaluechanged', handleDataReceived);
+    if (txCharacteristic) {
+      txCharacteristic.removeEventListener('characteristicvaluechanged', handleDataReceived);
     }
   } catch (e) { /* ignore */ }
 
